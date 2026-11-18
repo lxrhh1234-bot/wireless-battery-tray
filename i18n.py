@@ -1,0 +1,78 @@
+"""Bilingual (Chinese / English) UI strings for Wireless Battery Tray."""
+
+from __future__ import annotations
+
+TRANSLATIONS: dict[str, dict[str, str]] = {
+    "zh": {
+        "flyout_title": "设备电量",
+        "refresh": "刷新",
+        "settings": "设置",
+        "exit": "退出",
+        "empty_devices": "未检测到受支持的 2.4G / 蓝牙设备\n支持罗技 / 雷蛇 / VGN·ATK / 迈从 / Compx / ROG",
+        "sleep": "休眠",
+        "offline": "未连接",
+        "settings_title": "设置 - 2.4GHz 电量监控",
+        "sec_devices": "已识别设备名称",
+        "no_devices_detected": "暂未检测到已连接的受支持设备",
+        "sec_system": "系统",
+        "lang_label": "界面语言 / Language:",
+        "startup": "开机自动启动",
+        "hide_disconnected": "隐藏未连接接收器的设备",
+        "show_bluetooth": "显示已连接的蓝牙设备电量",
+        "auto_probe": "自动探测未知国产 2.4G 公版设备",
+        "low_batt_alert": "低电量桌面提醒（≤ %）:",
+        "poll_interval": "后台刷新间隔（秒）:",
+        "scan_hid": "扫描本机 HID 设备",
+        "cancel": "取消",
+        "save": "保存",
+        "scan_title": "本机 USB HID 设备扫描结果（只读）",
+        "scan_desc": "以下信息仅用于排查或反馈新设备适配（可全选复制）：",
+        "copy_all": "复制全部",
+        "menu_view": "查看设备电量",
+        "menu_refresh": "立即刷新",
+        "menu_settings": "设置...",
+        "menu_exit": "退出",
+        "tooltip_empty": "2.4GHz / 蓝牙设备电量监控",
+        "low_batt_title": "低电量提醒",
+        "low_batt_msg": "{alias} 当前电量仅剩 {pct}%，请及时充电",
+    },
+    "en": {
+        "flyout_title": "Battery",
+        "refresh": "Refresh",
+        "settings": "Settings",
+        "exit": "Exit",
+        "empty_devices": "No supported 2.4G / BT devices found\nSupports Logitech, Razer, VGN/ATK, MCHOSE, Compx, ROG",
+        "sleep": "Sleep",
+        "offline": "Offline",
+        "settings_title": "Settings - Wireless Battery Tray",
+        "sec_devices": "Detected Devices",
+        "no_devices_detected": "No supported devices detected",
+        "sec_system": "System",
+        "lang_label": "Language / 界面语言:",
+        "startup": "Run on Windows startup",
+        "hide_disconnected": "Hide disconnected devices",
+        "show_bluetooth": "Show connected Bluetooth devices",
+        "auto_probe": "Auto-probe generic 2.4G receivers",
+        "low_batt_alert": "Low battery alert (≤ %):",
+        "poll_interval": "Refresh interval (sec):",
+        "scan_hid": "Scan HID Devices",
+        "cancel": "Cancel",
+        "save": "Save",
+        "scan_title": "USB HID Device Scan (Read-Only)",
+        "scan_desc": "Read-only hardware info for troubleshooting or reporting new devices:",
+        "copy_all": "Copy All",
+        "menu_view": "View Battery",
+        "menu_refresh": "Refresh Now",
+        "menu_settings": "Settings...",
+        "menu_exit": "Exit",
+        "tooltip_empty": "2.4GHz & Bluetooth Battery Monitor",
+        "low_batt_title": "Low Battery Alert",
+        "low_batt_msg": "{alias} battery is at {pct}%. Please charge soon.",
+    },
+}
+
+
+def tr(lang: str, key: str) -> str:
+    """Return translated string for the given language ('zh' or 'en')."""
+    table = TRANSLATIONS.get(lang, TRANSLATIONS["zh"])
+    return table.get(key, TRANSLATIONS["zh"].get(key, key))

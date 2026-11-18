@@ -19,12 +19,17 @@
 
 ### 目前支持设备
 
-| 设备 | VID / PID / 协议 | 通信方式 |
+| 品牌 / 方案 | VID / 协议 | 通信方式 |
 | :--- | :--- | :--- |
-| **ASUS ROG PELTA (2.4GHz)** 无线耳机 | `0B05:1B84` | HID Output/Input Report (`0xCC 0x12 0x07`) |
-| **MCHOSE A7 Pro** 无线鼠标 | `5253:1021` | HID Feature Report (`0x11`) |
-| **Compx 2.4G 无线接收器**（如 AULA F75 / 迈从 / LEOBOG 等键盘） | `3554:FA09` | HID Output/Input Report (`0x13 0x05`) |
-| **Windows 已连接蓝牙设备**（耳机、键鼠、Xbox 手柄等） | 标准 Windows 蓝牙电量服务 | PnP `DEVPKEY_Device_BatteryPlusCharging` |
+| **罗技 Logitech**（Lightspeed / Unifying / Bolt） | `0x046D` | HID++ 2.0 (`0x1004` / `0x1000`) |
+| **雷蛇 Razer**（2.4GHz 鼠标/耳机） | `0x1532` | 90 字节 Feature Report (`0x07 0x80`) |
+| **海盗船 Corsair**（Bragi 2.4GHz 外设） | `0x1B1C` | Bragi 64 字节 HID (`0xFF42`) |
+| **VGN / VXE / ATK**（蜻蜓/R1/F1 等） | `0x373B` / `0x3554` | 17 字节 HID (`0x08 0x04`) |
+| **Compx 2.4G 方案**（狼蛛/LEOBOG/腹灵/迈从等） | `0x3554` | 20 字节 HID (`0x13 0x05`) |
+| **迈从 MCHOSE**（Realtek 2.4G 系列） | `0x5253` | 65 字节 Feature Report (`0x11`) |
+| **雷柏 Rapoo**（VT/MT 等 2.4GHz 鼠标） | `0x24AE` | HID `0xBB` 遥测报告 |
+| **华硕 ASUS ROG PELTA**（2.4GHz 耳机） | `0B05:1B84` | HID `0xCC 0x12 0x07` |
+| **全品牌蓝牙设备**（漫步者/阿米洛/Cherry/赛睿等） | Windows 蓝牙电量 | PnP `DEVPKEY_Device_BatteryPlusCharging` |
 
 > 你可以在 `hid_devices.py` 中参照现有轮询函数并添加到 `DEVICE_DEFINITIONS`，轻松扩展更多 2.4GHz 设备。
 

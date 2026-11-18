@@ -14,7 +14,8 @@ import winreg
 from PIL import Image, ImageDraw
 
 from config import load_config, save_config
-from hid_devices import DEVICE_DEFINITIONS, DeviceBatteryStatus, poll_bluetooth_devices
+from hid_devices import DeviceBatteryStatus, poll_all_24g_devices, poll_bluetooth_devices
+from i18n import tr
 from ui_windows import BatteryFlyout, SettingsWindow
 
 user32 = ctypes.windll.user32
@@ -258,11 +259,14 @@ def is_startup_enabled() -> bool:
 
 
 def set_startup_enabled(enable: bool) -> None:
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    if not os.path.exists(pythonw):
-        pythonw = sys.executable
-    script_path = os.path.abspath(__file__)
-    cmd = f'"{pythonw}" "{script_path}"'
+    if getattr(sys, "frozen", False):
+        cmd = f'"{os.path.abspath(sys.executable)}"'
+    else:
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        script_path = os.path.abspath(__file__)
+        cmd = f'"{pythonw}" "{script_path}"'
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
         if enable:
             winreg.SetValueEx(key, STARTUP_REG_NAME, 0, winreg.REG_SZ, cmd)
@@ -278,14 +282,7 @@ class BatteryTrayApp:
 
     def __init__(self) -> None:
         self.config = load_config()
-        self.statuses: dict[str, DeviceBatteryStatus] = {
-            key: DeviceBatteryStatus(
-                key=key,
-                name=self.config["aliases"].get(key, name),
-                short_label=tag,
-            )
-            for key, name, tag, _ in DEVICE_DEFINITIONS
-        }
+        self.statuses: dict[str, DeviceBatteryStatus] = {}
         self.bt_statuses: list[DeviceBatteryStatus] = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -302,24 +299,39 @@ class BatteryTrayApp:
         self.settings_win: SettingsWindow | None = None
 
     def _poll_once(self) -> None:
-        now = time.time()
-        for key, _name, _tag, poll_fn in DEVICE_DEFINITIONS:
-            try:
-                dongle_present, pct, charging = poll_fn()
-            except Exception:
-                dongle_present, pct, charging = False, None, False
-            with self.lock:
-                st = self.statuses[key]
-                st.dongle_present = dongle_present
-                if pct is not None:
-                    st.battery = pct
-                    st.charging = charging
-                    st.awake = True
-                    st.last_updated = now
-                    alias = self.config["aliases"].get(key, st.name)
-                    self._check_low_battery(key, alias, pct, charging)
-                else:
+        try:
+            discovered_24g = poll_all_24g_devices(
+                auto_probe_generic=bool(self.config.get("auto_probe_generic", True))
+            )
+        except Exception:
+            discovered_24g = []
+
+        present_keys = {d.key for d in discovered_24g}
+        with self.lock:
+            for key, st in self.statuses.items():
+                if key not in present_keys:
+                    st.dongle_present = False
                     st.awake = False
+
+            for d in discovered_24g:
+                existing = self.statuses.get(d.key)
+                if existing is None:
+                    self.statuses[d.key] = d
+                else:
+                    existing.dongle_present = True
+                    existing.name = d.name
+                    if d.battery is not None:
+                        existing.battery = d.battery
+                        existing.charging = d.charging
+                        existing.awake = True
+                        existing.last_updated = d.last_updated
+                    else:
+                        existing.awake = False
+
+        for d in discovered_24g:
+            if d.battery is not None:
+                alias = self.config["aliases"].get(d.key, d.name)
+                self._check_low_battery(d.key, alias, d.battery, d.charging)
 
         if self.config.get("show_bluetooth", True):
             try:
@@ -344,7 +356,11 @@ class BatteryTrayApp:
             return
         if pct <= threshold and key not in self._notified_low:
             self._notified_low.add(key)
-            self._send_balloon("低电量提醒", f"{alias} 当前电量仅剩 {pct}%，请及时充电")
+            lang = self.config.get("language", "zh")
+            self._send_balloon(
+                tr(lang, "low_batt_title"),
+                tr(lang, "low_batt_msg").format(alias=alias, pct=pct),
+            )
 
     def _send_balloon(self, title: str, message: str) -> None:
         if not self.hwnd:
@@ -375,11 +391,13 @@ class BatteryTrayApp:
             self.popup_win.render_devices(
                 snapshot,
                 self.config["aliases"],
-                hide_disconnected=bool(self.config.get("hide_disconnected", False)),
+                hide_disconnected=bool(self.config.get("hide_disconnected", True)),
+                lang=self.config.get("language", "zh"),
             )
 
     def _build_tooltip(self) -> str:
         aliases = self.config["aliases"]
+        lang = self.config.get("language", "zh")
         with self.lock:
             parts = []
             for st in list(self.statuses.values()) + list(self.bt_statuses):
@@ -388,9 +406,9 @@ class BatteryTrayApp:
                     chg = "⚡" if st.charging else ""
                     parts.append(f"{label}: {st.battery}%{chg}")
                 elif st.dongle_present:
-                    parts.append(f"{label}: 休眠")
+                    parts.append(f"{label}: {tr(lang, 'sleep')}")
             if not parts:
-                return "2.4GHz / 蓝牙设备电量监控"
+                return tr(lang, "tooltip_empty")
             return " | ".join(parts)[:127]
 
     def _update_tooltip(self) -> None:
@@ -423,7 +441,8 @@ class BatteryTrayApp:
             statuses=snapshot,
             aliases=self.config["aliases"],
             anchor_x=anchor_x,
-            hide_disconnected=bool(self.config.get("hide_disconnected", False)),
+            hide_disconnected=bool(self.config.get("hide_disconnected", True)),
+            lang=self.config.get("language", "zh"),
             on_refresh=lambda: self.refresh_event.set(),
             on_open_settings=self._open_settings,
             on_exit=self._request_exit,
@@ -436,9 +455,12 @@ class BatteryTrayApp:
             self.settings_win.lift()
             self.settings_win.focus_force()
             return
+        with self.lock:
+            snapshot = list(self.statuses.values()) + list(self.bt_statuses)
         self.settings_win = SettingsWindow(
             parent=self.root,
             config=self.config,
+            discovered_devices=snapshot,
             startup_enabled=is_startup_enabled(),
             on_save=self._apply_settings,
         )
@@ -461,13 +483,14 @@ class BatteryTrayApp:
         self.root.after(0, self.root.quit)
 
     def _show_context_menu(self) -> None:
+        lang = self.config.get("language", "zh")
         hmenu = user32.CreatePopupMenu()
-        user32.AppendMenuW(hmenu, MF_STRING, CMD_SHOW_POPUP, "查看设备电量")
-        user32.AppendMenuW(hmenu, MF_STRING, CMD_REFRESH, "立即刷新")
+        user32.AppendMenuW(hmenu, MF_STRING, CMD_SHOW_POPUP, tr(lang, "menu_view"))
+        user32.AppendMenuW(hmenu, MF_STRING, CMD_REFRESH, tr(lang, "menu_refresh"))
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(hmenu, MF_STRING, CMD_SETTINGS, "设置...")
+        user32.AppendMenuW(hmenu, MF_STRING, CMD_SETTINGS, tr(lang, "menu_settings"))
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(hmenu, MF_STRING, CMD_EXIT, "退出")
+        user32.AppendMenuW(hmenu, MF_STRING, CMD_EXIT, tr(lang, "menu_exit"))
 
         pt = POINT()
         user32.GetCursorPos(ctypes.byref(pt))

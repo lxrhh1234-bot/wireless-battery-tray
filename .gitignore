@@ -3,6 +3,9 @@ __pycache__/
 *$py.class
 .venv/
 venv/
+dist/
+build/
+*.spec
 config.json
 .DS_Store
 Thumbs.db

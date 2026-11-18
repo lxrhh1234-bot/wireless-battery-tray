@@ -1,4 +1,4 @@
-"""Windows HID device discovery and 2.4GHz peripheral battery readers."""
+"""Windows HID auto-discovery, 2.4GHz peripheral protocols, and Bluetooth PnP battery reader."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 import time
-from typing import Callable
 
 setupapi = ctypes.windll.setupapi
 hid = ctypes.windll.hid
 kernel32 = ctypes.windll.kernel32
 
 DIGCF_PRESENT = 0x02
+DIGCF_ALLCLASSES = 0x04
 DIGCF_DEVICEINTERFACE = 0x10
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 GENERIC_READ = 0x80000000
@@ -83,7 +83,20 @@ class OVERLAPPED(ctypes.Structure):
     ]
 
 
-# Configure ctypes signatures for 64-bit safety
+class _DEVPROPKEY(ctypes.Structure):
+    _fields_ = [("fmtid", GUID), ("pid", wintypes.ULONG)]
+
+
+class _SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("ClassGuid", GUID),
+        ("DevInst", wintypes.DWORD),
+        ("Reserved", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+# Configure 64-bit safe ctypes signatures
 setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
 setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
 setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
@@ -100,6 +113,30 @@ setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
     wintypes.DWORD,
     ctypes.POINTER(wintypes.DWORD),
     ctypes.c_void_p,
+]
+setupapi.SetupDiEnumDeviceInfo.argtypes = [
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(_SP_DEVINFO_DATA),
+]
+setupapi.SetupDiGetDevicePropertyW.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(_SP_DEVINFO_DATA),
+    ctypes.POINTER(_DEVPROPKEY),
+    ctypes.POINTER(wintypes.ULONG),
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.DWORD,
+]
+setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(_SP_DEVINFO_DATA),
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
 ]
 kernel32.CreateFileW.restype = ctypes.c_void_p
 kernel32.CreateFileW.argtypes = [
@@ -143,6 +180,7 @@ kernel32.ReadFile.argtypes = [
 ]
 hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
 hid.HidD_GetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDD_ATTRIBUTES)]
+hid.HidD_GetProductString.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.ULONG]
 hid.HidD_GetPreparsedData.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
 hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
@@ -152,7 +190,7 @@ hid.HidD_GetFeature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.ULONG
 
 @dataclass
 class DeviceBatteryStatus:
-    """Represents the current battery status of a 2.4GHz wireless device."""
+    """Represents the current battery status of a 2.4GHz or Bluetooth device."""
 
     key: str
     name: str
@@ -163,18 +201,24 @@ class DeviceBatteryStatus:
     awake: bool = False
     last_updated: float = 0.0
 
-    def display_text(self) -> str:
-        if not self.dongle_present:
-            return f"{self.name}: 未连接接收器"
-        if self.battery is None:
-            return f"{self.name}: 休眠/未开机"
-        suffix = " (充电中)" if self.charging else ""
-        stale = "" if self.awake else " [休眠]"
-        return f"{self.name}: {self.battery}%{suffix}{stale}"
+
+@dataclass
+class HidInterfaceInfo:
+    """Metadata for a present Windows HID interface."""
+
+    vid: int
+    pid: int
+    usage_page: int
+    usage: int
+    in_len: int
+    out_len: int
+    feat_len: int
+    product: str
+    path: str
 
 
-def find_hid_path(vid: int, pid: int, usage_page: int, usage: int) -> str | None:
-    """Find the Windows HID device path matching VID/PID and UsagePage/Usage."""
+def _enumerate_hid_interfaces() -> list[HidInterfaceInfo]:
+    """Enumerate all present HID interfaces in a single pass."""
     hid_guid = GUID()
     hid.HidD_GetHidGuid(ctypes.byref(hid_guid))
 
@@ -182,12 +226,12 @@ def find_hid_path(vid: int, pid: int, usage_page: int, usage: int) -> str | None
         ctypes.byref(hid_guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
     )
     if hdev == INVALID_HANDLE_VALUE:
-        return None
+        return []
 
+    items: list[HidInterfaceInfo] = []
     idx = 0
     if_data = SP_DEVICE_INTERFACE_DATA()
     if_data.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
-    matched_path: str | None = None
     cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
 
     try:
@@ -220,6 +264,9 @@ def find_hid_path(vid: int, pid: int, usage_page: int, usage: int) -> str | None
             attrs.Size = ctypes.sizeof(HIDD_ATTRIBUTES)
             hid.HidD_GetAttributes(handle, ctypes.byref(attrs))
 
+            prod_buf = ctypes.create_unicode_buffer(128)
+            hid.HidD_GetProductString(handle, prod_buf, 256)
+
             pp_data = ctypes.c_void_p()
             caps = HIDP_CAPS()
             has_caps = False
@@ -230,19 +277,24 @@ def find_hid_path(vid: int, pid: int, usage_page: int, usage: int) -> str | None
 
             kernel32.CloseHandle(handle)
 
-            if (
-                has_caps
-                and attrs.VendorID == vid
-                and attrs.ProductID == pid
-                and caps.UsagePage == usage_page
-                and caps.Usage == usage
-            ):
-                matched_path = path
-                break
+            if has_caps and attrs.VendorID != 0:
+                items.append(
+                    HidInterfaceInfo(
+                        vid=attrs.VendorID,
+                        pid=attrs.ProductID,
+                        usage_page=caps.UsagePage,
+                        usage=caps.Usage,
+                        in_len=caps.InputReportByteLength,
+                        out_len=caps.OutputReportByteLength,
+                        feat_len=caps.FeatureReportByteLength,
+                        product=prod_buf.value.strip(),
+                        path=path,
+                    )
+                )
     finally:
         setupapi.SetupDiDestroyDeviceInfoList(hdev)
 
-    return matched_path
+    return items
 
 
 def _open_rw(path: str, overlapped: bool = True) -> int | None:
@@ -261,7 +313,7 @@ def _open_rw(path: str, overlapped: bool = True) -> int | None:
     return h
 
 
-def _write_overlapped(handle: int, data: list[int], timeout_ms: int = 400) -> bool:
+def _write_overlapped(handle: int, data: list[int], timeout_ms: int = 350) -> bool:
     evt = kernel32.CreateEventW(None, True, False, None)
     ov = OVERLAPPED()
     ov.hEvent = evt
@@ -281,7 +333,7 @@ def _write_overlapped(handle: int, data: list[int], timeout_ms: int = 400) -> bo
         kernel32.CloseHandle(evt)
 
 
-def _read_overlapped(handle: int, size: int, timeout_ms: int = 350) -> bytes | None:
+def _read_overlapped(handle: int, size: int, timeout_ms: int = 250) -> bytes | None:
     evt = kernel32.CreateEventW(None, True, False, None)
     ov = OVERLAPPED()
     ov.hEvent = evt
@@ -301,109 +353,476 @@ def _read_overlapped(handle: int, size: int, timeout_ms: int = 350) -> bytes | N
         kernel32.CloseHandle(evt)
 
 
-def poll_rog_pelta() -> tuple[bool, int | None, bool]:
+def _query_rog_pelta(info: HidInterfaceInfo) -> tuple[int | None, bool]:
     """Query ASUS ROG PELTA (2.4GHz) headset battery via 0xCC 0x12 0x07."""
-    path = find_hid_path(0x0B05, 0x1B84, 0xFF00, 0x0001)
-    if not path:
-        return False, None, False
-    h = _open_rw(path, overlapped=True)
+    h = _open_rw(info.path, overlapped=True)
     if not h:
-        return True, None, False
+        return None, False
     try:
         cmd = [0xCC, 0x12, 0x07] + [0x00] * 61
         if not _write_overlapped(h, cmd):
-            return True, None, False
+            return None, False
         for _ in range(4):
-            res = _read_overlapped(h, 64, timeout_ms=300)
+            res = _read_overlapped(h, 64, timeout_ms=250)
             if not res:
                 break
             if len(res) >= 8 and res[0] == 0xCC and res[1] == 0x12 and res[2] == 0x07:
-                state = res[5]
-                pct = res[6]
+                state, pct = res[5], res[6]
                 if state != 0xFF and 0 <= pct <= 100:
-                    return True, pct, (state == 0x01)
-                return True, None, False
-        return True, None, False
+                    return pct, (state == 0x01)
+                return None, False
+        return None, False
     finally:
         kernel32.CloseHandle(h)
 
 
-def poll_mchose_a7() -> tuple[bool, int | None, bool]:
-    """Query MCHOSE A7 Pro mouse battery via 65-byte Feature Report 0x11."""
-    path = find_hid_path(0x5253, 0x1021, 0xFF01, 0x0001)
-    if not path:
-        return False, None, False
-    h = _open_rw(path, overlapped=False)
+def _query_mchose_realtek(info: HidInterfaceInfo) -> tuple[int | None, bool]:
+    """Query MCHOSE Realtek-based 2.4GHz mouse battery via 65-byte Feature Report 0x11."""
+    h = _open_rw(info.path, overlapped=False)
     if not h:
-        return True, None, False
+        return None, False
     try:
         buf = (ctypes.c_ubyte * 65)(*([0xFF] * 65))
         buf[0] = 0x11
         buf[1] = 0xF9
         if not hid.HidD_SetFeature(h, buf, 65):
-            return True, None, False
+            return None, False
         time.sleep(0.08)
         rbuf = (ctypes.c_ubyte * 65)()
         rbuf[0] = 0x11
         if not hid.HidD_GetFeature(h, rbuf, 65):
-            return True, None, False
-        raw = bytes(rbuf)
-        dec = bytes(b ^ 0xFF for b in raw[2:])
+            return None, False
+        dec = bytes(b ^ 0xFF for b in bytes(rbuf)[2:])
         if len(dec) >= 12 and dec[0] == 0x53 and dec[1] == 0x52:
             charging = dec[10] == 0x01
             pct = dec[11]
             if 1 <= pct <= 100:
-                return True, pct, charging
-        return True, None, False
+                return pct, charging
+        return None, False
     finally:
         kernel32.CloseHandle(h)
 
 
-def poll_compx_24g() -> tuple[bool, int | None, bool]:
-    """Query Compx 2.4G Wireless Receiver (3554:FA09) battery via 0x13 0x05."""
-    path = find_hid_path(0x3554, 0xFA09, 0xFF02, 0x0002)
-    if not path:
-        return False, None, False
-    h = _open_rw(path, overlapped=True)
+def _query_compx_24g(info: HidInterfaceInfo) -> tuple[int | None, bool]:
+    """Query Compx 2.4G wireless receiver (VID 0x3554) battery via 0x13 0x05."""
+    h = _open_rw(info.path, overlapped=True)
     if not h:
-        return True, None, False
+        return None, False
     try:
         cmd = [0x13, 0x05] + [0x00] * 18
         if not _write_overlapped(h, cmd):
-            return True, None, False
+            return None, False
         for _ in range(4):
-            res = _read_overlapped(h, 20, timeout_ms=300)
+            res = _read_overlapped(h, 20, timeout_ms=250)
             if not res:
                 break
             if len(res) >= 8 and res[0] == 0x13 and res[1] == 0x0A:
                 pct = res[6]
                 charging = (res[7] == 0x01) or ((res[7] & 0x10) != 0)
                 if 0 <= pct <= 100:
-                    return True, pct, charging
-                return True, None, False
-        return True, None, False
+                    return pct, charging
+                return None, False
+        return None, False
     finally:
         kernel32.CloseHandle(h)
 
 
-DEVICE_DEFINITIONS: list[tuple[str, str, str, Callable[[], tuple[bool, int | None, bool]]]] = [
-    ("rog_pelta", "ROG PELTA 耳机", "耳", poll_rog_pelta),
-    ("mchose_a7", "MCHOSE A7 Pro 鼠标", "鼠", poll_mchose_a7),
-    ("compx_24g", "Compx 2.4G 键盘", "键", poll_compx_24g),
-]
+def _hidpp_xfer(h: int, dev_idx: int, feat_idx: int, func_sw: int, params: list[int]) -> bytes | None:
+    pkt = [0x11, dev_idx, feat_idx, func_sw] + params
+    pkt += [0x00] * (20 - len(pkt))
+    if not _write_overlapped(h, pkt, timeout_ms=200):
+        return None
+    for _ in range(4):
+        res = _read_overlapped(h, 20, timeout_ms=200)
+        if not res:
+            break
+        if len(res) >= 8 and res[0] == 0x11 and res[1] == dev_idx:
+            if res[2] == 0xFF:  # HID++ error response
+                return None
+            if res[2] == feat_idx:
+                return res
+    return None
 
 
-class _DEVPROPKEY(ctypes.Structure):
-    _fields_ = [("fmtid", GUID), ("pid", wintypes.ULONG)]
+def _query_logitech_hidpp(info: HidInterfaceInfo) -> list[tuple[str, int | None, bool]]:
+    """Query Logitech HID++ 2.0 receivers (Lightspeed / Unifying / Bolt) for connected devices."""
+    h = _open_rw(info.path, overlapped=True)
+    if not h:
+        return []
+    results: list[tuple[str, int | None, bool]] = []
+    try:
+        # 0xFF = direct receiver/device; 0x01..0x06 = Unifying/Bolt paired slots
+        for dev_idx in (0xFF, 0x01, 0x02, 0x03):
+            # Try UnifiedBattery (0x1004) first, then BatteryLevelStatus (0x1000)
+            for feat_id, is_unified in ((0x1004, True), (0x1000, False)):
+                resp = _hidpp_xfer(h, dev_idx, 0x00, 0x0A, [(feat_id >> 8) & 0xFF, feat_id & 0xFF])
+                if not resp or resp[4] == 0:
+                    continue
+                feat_idx = resp[4]
+                batt_resp = _hidpp_xfer(h, dev_idx, feat_idx, 0x1A if is_unified else 0x0A, [])
+                if batt_resp:
+                    pct = batt_resp[4]
+                    if 0 <= pct <= 100:
+                        charging = batt_resp[6] in (1, 2, 3) if not is_unified else batt_resp[6] in (1, 2, 3)
+                        slot_suffix = "" if dev_idx == 0xFF else f" #{dev_idx}"
+                        label = (info.product or "Logitech 2.4G") + slot_suffix
+                        results.append((label, pct, charging))
+                        break
+            if dev_idx == 0xFF and results:
+                break
+    finally:
+        kernel32.CloseHandle(h)
+    return results
 
 
-class _SP_DEVINFO_DATA(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("ClassGuid", GUID),
-        ("DevInst", wintypes.DWORD),
-        ("Reserved", ctypes.POINTER(ctypes.c_ulong)),
-    ]
+def _razer_xfer(h: int, tx_id: int, cmd_id: int) -> bytes | None:
+    req = bytearray(91)  # Report ID 0x00 + 90-byte Razer payload
+    req[0] = 0x00
+    req[1] = 0x00  # Status: new command
+    req[2] = tx_id
+    req[6] = 0x02  # Data size
+    req[7] = 0x07  # Command class: Power
+    req[8] = cmd_id
+    crc = 0
+    for b in req[3:89]:
+        crc ^= b
+    req[89] = crc
+    buf = (ctypes.c_ubyte * 91)(*req)
+    if not hid.HidD_SetFeature(h, buf, 91):
+        return None
+    time.sleep(0.05)
+    rbuf = (ctypes.c_ubyte * 91)()
+    if not hid.HidD_GetFeature(h, rbuf, 91):
+        return None
+    raw = bytes(rbuf)
+    payload = raw[1:] if len(raw) == 91 else raw
+    if len(payload) >= 90 and payload[0] == 0x02:
+        return payload
+    return None
+
+
+def _query_razer(info: HidInterfaceInfo) -> tuple[int | None, bool]:
+    """Query Razer wireless mouse/headset battery via 90-byte Feature Report (VID 0x1532)."""
+    h = _open_rw(info.path, overlapped=False)
+    if not h:
+        return None, False
+    try:
+        for tx_id in (0x1F, 0x3F, 0xFF):
+            resp = _razer_xfer(h, tx_id, 0x80)
+            if resp is not None:
+                raw_batt = resp[9]
+                pct = max(0, min(100, round((raw_batt / 255.0) * 100)))
+                chg_resp = _razer_xfer(h, tx_id, 0x84)
+                charging = bool(chg_resp and chg_resp[9] == 1)
+                return pct, charging
+        return None, False
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def _query_vgn_atk(info: HidInterfaceInfo) -> tuple[int | None, bool]:
+    """Query VGN / VXE / ATK wireless mice via 17-byte 0x08 0x04 HID protocol."""
+    h = _open_rw(info.path, overlapped=True)
+    if not h:
+        return None, False
+    try:
+        pkt = [0x08, 0x04] + [0x00] * 14
+        cs = (0x55 - sum(pkt)) & 0xFF
+        pkt.append(cs)
+        if not _write_overlapped(h, pkt, timeout_ms=250):
+            return None, False
+        for _ in range(4):
+            res = _read_overlapped(h, 17, timeout_ms=250)
+            if not res:
+                break
+            if len(res) >= 8 and res[0] == 0x08 and res[1] == 0x04:
+                pct = res[6]
+                charging = res[7] in (1, 2)
+                if 0 <= pct <= 100:
+                    return pct, charging
+                return None, False
+        return None, False
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def _query_corsair_bragi(info: HidInterfaceInfo) -> tuple[int | None, bool]:
+    """Query Corsair Bragi 2.4G peripherals (VID 0x1B1C, UsagePage 0xFF42)."""
+    h = _open_rw(info.path, overlapped=True)
+    if not h:
+        return None, False
+    try:
+        out_len = max(info.out_len, 64)
+        in_len = max(info.in_len, 64)
+        cmd = [0x00, 0x07, 0x01, 0x0F] + [0x00] * (out_len - 4)
+        if not _write_overlapped(h, cmd, timeout_ms=250):
+            return None, False
+        for _ in range(4):
+            res = _read_overlapped(h, in_len, timeout_ms=250)
+            if not res:
+                break
+            if len(res) >= 6 and res[3] == 0x0F:
+                raw_val = res[4] | (res[5] << 8)
+                pct = raw_val // 10 if raw_val > 100 else raw_val
+                if 0 <= pct <= 100:
+                    return pct, False
+        return None, False
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def _query_rapoo(info: HidInterfaceInfo) -> tuple[int | None, bool]:
+    """Query Rapoo 2.4G wireless mice (VID 0x24AE) via 0xBB telemetry report."""
+    h = _open_rw(info.path, overlapped=True)
+    if not h:
+        return None, False
+    try:
+        in_len = max(info.in_len, 7)
+        for _ in range(3):
+            res = _read_overlapped(h, in_len, timeout_ms=250)
+            if not res:
+                break
+            if len(res) >= 7 and res[0] == 0xBB:
+                charging = res[5] == 0x02
+                pct = res[6]
+                if 0 <= pct <= 100:
+                    return pct, charging
+        return None, False
+    finally:
+        kernel32.CloseHandle(h)
+
+
+_KNOWN_VIDS = {0x0B05, 0x5253, 0x3554, 0x046D, 0x1532, 0x373B, 0x1B1C, 0x24AE, 0x045E, 0x054C, 0x057E}
+_PROBE_CACHE: dict[str, str | None] = {}
+
+
+def scan_hid_summary() -> str:
+    """Read-only diagnostic scan of connected USB HID interfaces for troubleshooting."""
+    lines: list[str] = []
+    seen: set[tuple[int, int, int, int, int, int, int]] = set()
+    for info in _enumerate_hid_interfaces():
+        if "vid_" not in info.path.lower():
+            continue
+        sig = (info.vid, info.pid, info.usage_page, info.usage, info.in_len, info.out_len, info.feat_len)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        prod = info.product or "(Unknown)"
+        lines.append(
+            f"VID={info.vid:04X} PID={info.pid:04X} UP={info.usage_page:04X} U={info.usage:04X} "
+            f"In={info.in_len} Out={info.out_len} Feat={info.feat_len} | {prod}"
+        )
+    return "\n".join(lines) if lines else "未检测到 USB HID 设备"
+
+
+def poll_all_24g_devices(auto_probe_generic: bool = True) -> list[DeviceBatteryStatus]:
+    """Auto-discover and poll all supported 2.4GHz HID devices currently connected."""
+    now = time.time()
+    interfaces = _enumerate_hid_interfaces()
+    devices: list[DeviceBatteryStatus] = []
+    seen_keys: set[str] = set()
+
+    for info in interfaces:
+        # 1. ASUS ROG PELTA (2.4GHz)
+        if info.vid == 0x0B05 and info.pid == 0x1B84 and info.usage_page == 0xFF00 and info.usage == 0x0001:
+            key = "hid_0b05_1b84"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_rog_pelta(info)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or "ROG PELTA 耳机",
+                        short_label="耳",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 2. MCHOSE Realtek 2.4G series (VID 0x5253, UsagePage 0xFF01, Feat 65)
+        elif info.vid == 0x5253 and info.usage_page == 0xFF01 and info.usage == 0x0001 and info.feat_len == 65:
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_mchose_realtek(info)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or "MCHOSE 2.4G 设备",
+                        short_label="鼠",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 3. Compx 2.4G generic receivers (VID 0x3554, UsagePage 0xFF02, 20-byte frames)
+        elif info.vid == 0x3554 and info.usage_page == 0xFF02 and info.usage == 0x0002 and info.out_len == 20:
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_compx_24g(info)
+                prod = info.product
+                if not prod or prod == "2.4G Wireless Receiver":
+                    prod = "Compx 2.4G 键鼠"
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=prod,
+                        short_label="键",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 4. Logitech HID++ 2.0 receivers (VID 0x046D, UsagePage 0xFF00, 20-byte long reports)
+        elif info.vid == 0x046D and info.usage_page == 0xFF00 and info.in_len == 20 and info.out_len == 20:
+            key_prefix = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key_prefix not in seen_keys:
+                seen_keys.add(key_prefix)
+                for idx, (label, pct, charging) in enumerate(_query_logitech_hidpp(info)):
+                    devices.append(
+                        DeviceBatteryStatus(
+                            key=f"{key_prefix}_{idx}",
+                            name=label,
+                            short_label="罗",
+                            battery=pct,
+                            charging=charging,
+                            dongle_present=True,
+                            awake=pct is not None,
+                            last_updated=now if pct is not None else 0.0,
+                        )
+                    )
+
+        # 5. Razer 2.4G wireless peripherals (VID 0x1532, 90/91-byte Feature Report)
+        elif info.vid == 0x1532 and info.feat_len >= 90:
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_razer(info)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or "Razer 2.4G 设备",
+                        short_label="雷",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 6. VGN / VXE / ATK 2.4G mice (VID 0x373B or 0x3554, 17-byte 0x08 0x04 reports)
+        elif info.vid in (0x373B, 0x3554) and info.in_len == 17 and info.out_len == 17 and info.usage_page >= 0xFF00:
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_vgn_atk(info)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or "VGN/ATK 2.4G 鼠标",
+                        short_label="鼠",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 7. Corsair Bragi 2.4G peripherals (VID 0x1B1C, UsagePage 0xFF42)
+        elif info.vid == 0x1B1C and info.usage_page == 0xFF42:
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_corsair_bragi(info)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or "Corsair 2.4G 设备",
+                        short_label="船",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 8. Rapoo 2.4G wireless mice (VID 0x24AE, vendor interface pushing 0xBB reports)
+        elif info.vid == 0x24AE and info.usage_page >= 0xFF00 and info.in_len >= 7:
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                pct, charging = _query_rapoo(info)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or "Rapoo 2.4G 鼠标",
+                        short_label="柏",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+        # 9. Safe cached auto-probe for unknown USB 2.4G receivers using common 17/20-byte protocols
+        elif (
+            auto_probe_generic
+            and "vid_" in info.path.lower()
+            and info.vid not in _KNOWN_VIDS
+            and info.usage_page >= 0xFF00
+            and ((info.in_len == 17 and info.out_len == 17) or (info.in_len == 20 and info.out_len == 20))
+        ):
+            key = f"hid_{info.vid:04x}_{info.pid:04x}"
+            if key in seen_keys:
+                continue
+            cached = _PROBE_CACHE.get(info.path, "UNPROBED")
+            if cached is None:
+                continue
+            proto = cached
+            pct, charging = None, False
+            if proto == "UNPROBED":
+                if info.in_len == 17:
+                    pct, charging = _query_vgn_atk(info)
+                    proto = "vgn17" if pct is not None else None
+                else:
+                    pct, charging = _query_compx_24g(info)
+                    proto = "compx20" if pct is not None else None
+                _PROBE_CACHE[info.path] = proto
+            elif proto == "vgn17":
+                pct, charging = _query_vgn_atk(info)
+            elif proto == "compx20":
+                pct, charging = _query_compx_24g(info)
+
+            if proto is not None:
+                seen_keys.add(key)
+                devices.append(
+                    DeviceBatteryStatus(
+                        key=key,
+                        name=info.product or f"2.4G 设备 ({info.vid:04X}:{info.pid:04X})",
+                        short_label="无",
+                        battery=pct,
+                        charging=charging,
+                        dongle_present=True,
+                        awake=pct is not None,
+                        last_updated=now if pct is not None else 0.0,
+                    )
+                )
+
+    return devices
 
 
 _DIGCF_ALLCLASSES = 0x04
@@ -417,31 +836,6 @@ _DEVPKEY_IS_CONNECTED = _DEVPROPKEY(
     GUID(0x83DA6326, 0x97A6, 0x4088, (ctypes.c_ubyte * 8)(0x94, 0x53, 0xA1, 0x92, 0x3F, 0x57, 0x3B, 0x29)),
     15,
 )
-
-setupapi.SetupDiEnumDeviceInfo.argtypes = [
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    ctypes.POINTER(_SP_DEVINFO_DATA),
-]
-setupapi.SetupDiGetDevicePropertyW.argtypes = [
-    ctypes.c_void_p,
-    ctypes.POINTER(_SP_DEVINFO_DATA),
-    ctypes.POINTER(_DEVPROPKEY),
-    ctypes.POINTER(wintypes.ULONG),
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-    wintypes.DWORD,
-]
-setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
-    ctypes.c_void_p,
-    ctypes.POINTER(_SP_DEVINFO_DATA),
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-]
 
 
 def _clean_bt_name(raw_name: str) -> str:
